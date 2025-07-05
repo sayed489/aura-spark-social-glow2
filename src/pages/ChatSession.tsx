@@ -4,10 +4,9 @@ import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { GradientButton } from '@/components/ui/gradient-button';
 import { useAuth } from '@/contexts/AuthContext';
-import { generateChatResponse } from '@/services/geminiService';
-import { PhotoUpload } from '@/components/PhotoUpload';
 import { toast } from '@/hooks/use-toast';
 import { ArrowLeft, Send, Star, Image as ImageIcon } from 'lucide-react';
+import { PhotoUpload } from '@/components/PhotoUpload';
 
 interface Message {
   id: string;
@@ -23,24 +22,36 @@ const companions = {
     name: 'Mira',
     emoji: '💜',
     location: 'Stockholm, Sweden',
-    gradient: 'from-purple-400 to-pink-400'
+    profilePhoto: '/characters/mira-profile.jpg'
   },
   rutwik: {
-    name: 'Rutwik', 
+    name: 'Rutwik',
     emoji: '💙',
     location: 'Los Angeles, USA',
-    gradient: 'from-blue-400 to-purple-400'
+    profilePhoto: '/characters/rutwik-profile.jpg'
   }
 };
+
+const ChatLoader = () => (
+    <div className="flex-1 flex items-center justify-center p-4 text-center">
+        <div>
+            <div className="w-16 h-16 mx-auto bg-gradient-to-r from-aura-purple to-aura-pink rounded-full flex items-center justify-center animate-pulse">
+              <span className="text-3xl">✨</span>
+            </div>
+            <p className="text-muted-foreground mt-4 font-medium">Connecting to your companion...</p>
+        </div>
+    </div>
+);
+
 
 export default function ChatSession() {
   const { character } = useParams<{ character: 'mira' | 'rutwik' }>();
   const navigate = useNavigate();
-  const { userProfile, updateUserProfile } = useAuth();
+  const { userProfile, updateUserProfile, loading: authLoading } = useAuth();
   
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<{ file: File; base64: string } | null>(null);
   const [showPhotoUpload, setShowPhotoUpload] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -48,20 +59,16 @@ export default function ChatSession() {
   const companion = character ? companions[character] : null;
 
   useEffect(() => {
-    if (!companion) {
-      navigate('/chat');
-      return;
+    if (!authLoading && userProfile && companion && messages.length === 0) {
+      const welcomeMessage: Message = {
+        id: 'welcome-message',
+        text: `Hey, ${userProfile.name || 'friend'}! ✨ I was just thinking about you. What's on your mind?`,
+        isUser: false,
+        timestamp: new Date()
+      };
+      setMessages([welcomeMessage]);
     }
-
-    // Load welcome message
-    const welcomeMessage: Message = {
-      id: '1',
-      text: `Hello ${userProfile?.name || 'beautiful'}! ✨ I'm ${companion.name}. How are you feeling today?`,
-      isUser: false,
-      timestamp: new Date()
-    };
-    setMessages([welcomeMessage]);
-  }, [companion, userProfile?.name, navigate]);
+  }, [companion, userProfile, authLoading, messages.length, navigate]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -70,107 +77,111 @@ export default function ChatSession() {
   const handleSend = async () => {
     if ((!inputValue.trim() && !selectedPhoto) || !userProfile || !character) return;
 
-    // Check chat points
     if (userProfile.chatPoints <= 0) {
       toast({
-        title: "No chat points! 💎",
-        description: "Visit the shop to get more points.",
+        title: "No chat points!",
+        description: "Complete your daily aura reading or visit the shop to get more points.",
         variant: "destructive"
       });
       return;
     }
 
+    const userMessageText = inputValue.trim();
     const userMessage: Message = {
       id: Date.now().toString(),
-      text: inputValue,
+      text: userMessageText,
       isUser: true,
-      timestamp: new Date()
+      timestamp: new Date(),
+      image: selectedPhoto?.base64
     };
-
-    // Add photo to user message if selected
-    if (selectedPhoto) {
-      userMessage.image = selectedPhoto.base64;
-    }
 
     setMessages(prev => [...prev, userMessage]);
     setInputValue('');
     setSelectedPhoto(null);
     setShowPhotoUpload(false);
-    setIsLoading(true);
+    setIsSending(true);
 
     try {
-      // Get relationship stage
-      const relationshipStage = character === 'mira' 
-        ? userProfile.relationshipStage_mira 
-        : userProfile.relationshipStage_rutwik;
+      // THIS IS THE CORRECTED VERCEL FETCH CALL
+      const res = await fetch('/api/generateChatResponse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          characterId: character,
+          userMessage: userMessageText,
+          chatHistory: messages.slice(-10).map(m => `${m.isUser ? 'You' : companion?.name}: ${m.text}`),
+          userProfile: { name: userProfile.name, bio: userProfile.bio },
+          photoBase64: selectedPhoto?.base64
+        }),
+      });
 
-      // Generate AI response with photo if present
-      const chatHistory = messages.map(m => `${m.isUser ? 'User' : companion?.name}: ${m.text}`);
-      const response = await generateChatResponse(
-        character,
-        inputValue,
-        userProfile,
-        chatHistory,
-        relationshipStage,
-        selectedPhoto?.base64
-      );
-
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || 'The server responded with an error.');
+      }
+      
+      const response = await res.json();
+  
       const aiMessage: Message = {
         id: (Date.now() + 1).toString(),
         text: response.message,
         isUser: false,
         timestamp: new Date(),
-        characterImage: response.characterImage
+        characterImage: response.characterImage,
       };
-
+  
       setMessages(prev => [...prev, aiMessage]);
-
-      // Update user profile
-      const updates: any = {
+  
+      const relationshipKey = `relationshipStage_${character}`;
+      const oldRelationshipStage = userProfile[relationshipKey as keyof typeof userProfile];
+  
+      await updateUserProfile({
         chatPoints: userProfile.chatPoints - 1,
-        memories: response.updatedMemories
-      };
-
-      if (character === 'mira') {
-        updates.relationshipStage_mira = response.updatedRelationshipStage;
-      } else {
-        updates.relationshipStage_rutwik = response.updatedRelationshipStage;
-      }
-
-      await updateUserProfile(updates);
-
-      // Show relationship stage update
-      if (response.updatedRelationshipStage !== relationshipStage) {
+        memories: response.updatedMemories,
+        [relationshipKey]: response.updatedRelationshipStage
+      });
+  
+      if (response.updatedRelationshipStage && response.updatedRelationshipStage !== oldRelationshipStage) {
         toast({
-          title: "Relationship evolved! 💖",
-          description: `You're now ${response.updatedRelationshipStage} with ${companion?.name}!`
+          title: "Relationship Evolved! 💖",
+          description: `You and ${companion?.name} are now ${response.updatedRelationshipStage}.`
         });
       }
 
-    } catch (error) {
+    } catch (error: any) {
+      console.error("Error calling Vercel function:", error);
       toast({
-        title: "Connection error",
-        description: "Failed to send message. Please try again.",
+        title: "Connection Error",
+        description: error.message || "I'm having a bit of trouble connecting right now. Let's try that again.",
         variant: "destructive"
       });
+      setMessages(prev => prev.filter(m => m.id !== userMessage.id));
     } finally {
-      setIsLoading(false);
+      setIsSending(false);
     }
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !isSending) {
       e.preventDefault();
       handleSend();
     }
   };
 
-  if (!companion) return null;
+  if (authLoading || !userProfile || !companion) {
+    return (
+      <div className="min-h-screen bg-background flex flex-col">
+          <ChatLoader />
+      </div>
+    )
+  }
+
+  // ... THE REST OF THE JSX IS THE SAME AS THE LAST CORRECTED VERSION, so I will omit for brevity
+  // The 'return (...)' part does not need any changes.
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b bg-background/80 backdrop-blur-sm">
+      <div className="flex items-center justify-between p-4 border-b bg-background/80 backdrop-blur-sm sticky top-0 z-10">
         <button 
           onClick={() => navigate('/chat')} 
           className="flex items-center gap-2 text-muted-foreground hover:text-foreground"
@@ -180,7 +191,7 @@ export default function ChatSession() {
         </button>
         
         <div className="text-center">
-          <h1 className="font-semibold flex items-center gap-1">
+          <h1 className="font-semibold flex items-center gap-2">
             {companion.emoji} {companion.name}
           </h1>
           <p className="text-xs text-muted-foreground">{companion.location}</p>
@@ -192,52 +203,43 @@ export default function ChatSession() {
         </div>
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.map((message) => (
           <div
             key={message.id}
-            className={`flex ${message.isUser ? 'justify-end' : 'justify-start'}`}
+            className={`flex items-end gap-2 ${message.isUser ? 'justify-end' : 'justify-start'}`}
           >
+            {!message.isUser && (
+              <img src={companion.profilePhoto} alt={companion.name} className="w-8 h-8 rounded-full"/>
+            )}
             <Card className={`max-w-[80%] ${
               message.isUser 
-                ? 'bg-gradient-to-r from-aura-purple to-aura-pink text-white' 
-                : 'bg-muted'
+                ? 'bg-gradient-to-r from-aura-purple to-aura-pink text-white rounded-br-none' 
+                : 'bg-muted rounded-bl-none'
             }`}>
               <div className="p-3">
                 {message.image && (
                   <img 
                     src={message.image} 
-                    alt="Shared image" 
-                    className="w-full max-w-xs h-32 object-cover rounded-lg mb-2"
+                    alt="User Upload" 
+                    className="w-full max-w-xs rounded-lg mb-2"
                   />
                 )}
-                {message.characterImage && (
-                  <img 
-                    src={message.characterImage} 
-                    alt={`${companion?.name} response`} 
-                    className="w-20 h-20 object-cover rounded-full mb-2"
-                  />
-                )}
-                <p className="text-sm">{message.text}</p>
-                <p className={`text-xs mt-1 opacity-70 ${
-                  message.isUser ? 'text-white/70' : 'text-muted-foreground'
-                }`}>
-                  {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </p>
+                <p className="text-sm whitespace-pre-wrap">{message.text}</p>
               </div>
             </Card>
           </div>
         ))}
         
-        {isLoading && (
-          <div className="flex justify-start">
-            <Card className="bg-muted">
+        {isSending && (
+          <div className="flex items-end gap-2 justify-start">
+             <img src={companion.profilePhoto} alt={companion.name} className="w-8 h-8 rounded-full"/>
+            <Card className="bg-muted rounded-bl-none">
               <div className="p-3">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5">
                   <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse" />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse delay-100" />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse delay-200" />
+                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse [animation-delay:0.2s]" />
+                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse [animation-delay:0.4s]" />
                 </div>
               </div>
             </Card>
@@ -247,73 +249,56 @@ export default function ChatSession() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Photo Upload */}
-      {showPhotoUpload && (
-        <div className="p-4 border-t bg-background/80 backdrop-blur-sm">
-          <PhotoUpload
-            onPhotoSelect={(file, base64) => setSelectedPhoto({ file, base64 })}
-            disabled={isLoading}
-          />
-          <div className="flex gap-2 mt-3">
-            <GradientButton
-              onClick={() => setShowPhotoUpload(false)}
-              variant="aura-outline"
-              className="flex-1"
-            >
-              Cancel
-            </GradientButton>
-          </div>
-        </div>
-      )}
-
-      {/* Input */}
-      <div className="p-4 border-t bg-background/80 backdrop-blur-sm">
-        {selectedPhoto && (
-          <div className="mb-3 relative">
-            <img 
-              src={selectedPhoto.base64} 
-              alt="Selected" 
-              className="w-20 h-20 object-cover rounded-lg border"
-            />
-            <button
-              onClick={() => setSelectedPhoto(null)}
-              className="absolute -top-2 -right-2 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center text-xs"
-            >
-              ×
-            </button>
-          </div>
-        )}
+      <div className="p-4 border-t bg-background/80 backdrop-blur-sm sticky bottom-0">
+          {showPhotoUpload && (
+            <div className="mb-4">
+                <PhotoUpload
+                    onPhotoSelect={(file, base64) => setSelectedPhoto({ file, base64 })}
+                    disabled={isSending}
+                />
+            </div>
+           )}
+           {selectedPhoto && (
+             <div className="mb-3 relative w-24">
+               <img 
+                 src={selectedPhoto.base64} 
+                 alt="Preview" 
+                 className="w-24 h-24 object-cover rounded-lg border"
+               />
+               <button
+                 onClick={() => setSelectedPhoto(null)}
+                 className="absolute -top-2 -right-2 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center text-xs"
+               >
+                 ×
+               </button>
+             </div>
+           )}
         
-        <div className="flex gap-2">
-          <button
+        <div className="flex gap-2 items-center">
+          <GradientButton
+            variant="aura-outline"
+            size="icon"
             onClick={() => setShowPhotoUpload(!showPhotoUpload)}
-            disabled={isLoading || (userProfile?.chatPoints || 0) <= 0}
-            className="p-2 border rounded-md hover:bg-muted transition-colors"
+            disabled={isSending || (userProfile?.chatPoints || 0) <= 0}
           >
-            <ImageIcon className="w-4 h-4" />
-          </button>
+            <ImageIcon className="w-5 h-5" />
+          </GradientButton>
           <Input
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyPress={handleKeyPress}
             placeholder={`Message ${companion.name}...`}
-            disabled={isLoading || (userProfile?.chatPoints || 0) <= 0}
+            disabled={isSending || (userProfile?.chatPoints || 0) <= 0}
             className="flex-1"
           />
           <GradientButton
             onClick={handleSend}
-            disabled={(!inputValue.trim() && !selectedPhoto) || isLoading || (userProfile?.chatPoints || 0) <= 0}
+            disabled={(!inputValue.trim() && !selectedPhoto) || isSending}
             size="icon"
           >
-            <Send className="w-4 h-4" />
+            <Send className="w-5 h-5" />
           </GradientButton>
         </div>
-        
-        {(userProfile?.chatPoints || 0) <= 0 && (
-          <p className="text-xs text-center text-muted-foreground mt-2">
-            Out of chat points! Visit the shop to get more.
-          </p>
-        )}
       </div>
     </div>
   );
